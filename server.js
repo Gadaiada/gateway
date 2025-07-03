@@ -1,105 +1,120 @@
-// server.js – ponte Shopify / Webkul → Asaas
-// Deploy grátis: Render, Railway, Vercel (funciona como "Serverless Function")
-
+// server.js
 import express from "express";
-import fetch from "node-fetch";
-import dotenv from "dotenv";
-import dayjs from "dayjs";
+import dotenv   from "dotenv";
+import fetch    from "node-fetch";   // node-fetch v3
+import dayjs    from "dayjs";
+import cors     from "cors";
 
 dotenv.config();
 
-const app = express();
+const app  = express();
+const PORT = process.env.PORT || 4000;
+
+// ————————————————————————————————
+// 1. Middleware
+// ————————————————————————————————
+
+// CORS simples para chamadas frontend
+app.use(cors());
+
+// Para receber JSON no webhook
 app.use(express.json());
 
-const ASAAS = "https://api.asaas.com/v3";
-const HEADERS = {
-  "Content-Type": "application/json",
-  access_token: process.env.ASAAS_TOKEN,
+// ————————————————————————————————
+// 2. Helpers
+// ————————————————————————————————
+const ASAAS_BASE = "https://api.asaas.com/v3";
+
+// Wrapper que sempre devolve JSON ou lança erro com log detalhado
+const asaas = async (path, { method = "GET", body = null } = {}) => {
+  const res = await fetch(`${ASAAS_BASE}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      access_token: process.env.ASAAS_TOKEN,
+    },
+    body: body ? JSON.stringify(body) : null,
+  });
+
+  const raw = await res.text();         // corpo bruto (pode ser vazio)
+
+  if (!res.ok) {
+    console.error(`Asaas ${method} ${path} → ${res.status}`, raw);
+    throw new Error(`Asaas ${res.status} ${path}`);
+  }
+
+  if (!raw) return {};                  // evita “Unexpected end of JSON input”
+
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error(`Falha ao parsear JSON (${path}):`, raw.slice(0, 200));
+    throw new Error("Resposta Asaas não‑JSON");
+  }
 };
 
-/**
- * Retorna o ID do cliente no Asaas; cria se não existir.
- */
-async function ensureCustomer(email, name) {
-  const q = await fetch(`${ASAAS}/customers?email=${encodeURIComponent(email)}`, {
-    headers: HEADERS,
-  });
-  const { data } = await q.json();
-  if (data.length) return data[0].id;
+// Busca cliente pelo e‑mail; cria se não existir
+const ensureCustomer = async ({ email, name }) => {
+  const search = await asaas(`/customers?email=${encodeURIComponent(email)}`);
+  if (search?.data?.length) return search.data[0];
 
-  const r = await fetch(`${ASAAS}/customers`, {
+  return asaas("/customers", {
     method: "POST",
-    headers: HEADERS,
-    body: JSON.stringify({ name, email }),
+    body: { email, name },
   });
-  const created = await r.json();
-  return created.id;
-}
+};
 
-/**
- * Cria uma assinatura mensal e devolve o link da primeira cobrança
- */
-async function createSubscription(customerId, value, description) {
-  const nextDueDate = dayjs().add(1, "day").format("YYYY-MM-DD");
+// ————————————————————————————————
+// 3. Rotas
+// ————————————————————————————————
+app.get("/", (_, res) => res.json({ status: "online" }));
 
-  const subResp = await fetch(`${ASAAS}/subscriptions`, {
-    method: "POST",
-    headers: HEADERS,
-    body: JSON.stringify({
-      customer: customerId,
-      billingType: "UNDEFINED", // habilita PIX + Cartão
-      cycle: "MONTHLY",
-      nextDueDate,
-      value,
-      description,
-    }),
-  });
-  const sub = await subResp.json();
-
-  const payResp = await fetch(`${ASAAS}/subscriptions/${sub.id}/payments`, {
-    headers: HEADERS,
-  });
-  const payData = await payResp.json();
-  return payData.data[0].invoiceUrl;
-}
-
-// ------------------------------------------------------------
-// Rota chamada pelo botão no Webkul – ex: /checkout/asaas?email=x&name=y
-// ------------------------------------------------------------
 app.get("/checkout/asaas", async (req, res) => {
+  const { email, name } = req.query;
+  if (!email || !name)
+    return res.status(400).json({ error: "Parâmetros email e name são obrigatórios" });
+
   try {
-    const { email, name } = req.query;
-    if (!email || !name) return res.status(400).json({ error: "email e name são obrigatórios" });
+    // 1. cliente
+    const customer = await ensureCustomer({ email, name });
 
-    const customerId = await ensureCustomer(email, name);
-    const invoiceUrl = await createSubscription(
-      customerId,
-      Number(process.env.PLAN_VALUE),
-      process.env.PLAN_DESCRIPTION,
-    );
+    // 2. assinatura
+    const subscription = await asaas("/subscriptions", {
+      method: "POST",
+      body: {
+        customer: customer.id,
+        billingType: "UNDEFINED",
+        cycle: "MONTHLY",
+        nextDueDate: dayjs().add(1, "day").format("YYYY-MM-DD"),
+        value: Number(process.env.PLAN_VALUE),
+        description: process.env.PLAN_DESCRIPTION,
+      },
+    });
 
-    return res.json({ invoiceUrl });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "erro interno", message: err.message });
+    // 3. link de pagamento
+    const link = await asaas("/paymentLinks", {
+      method: "POST",
+      body: {
+        chargeType: "SUBSCRIPTION",
+        subscription: subscription.id,
+        name: process.env.PLAN_DESCRIPTION,
+      },
+    });
+
+    return res.json({ invoiceUrl: link.url });
+  } catch (e) {
+    console.error("checkout/asaas erro:", e.message);
+    return res.status(500).json({ error: "erro interno", message: e.message });
   }
 });
 
-// ------------------------------------------------------------
-// Webhook do Asaas
-// ------------------------------------------------------------
-app.post("/webhook/asaas", async (req, res) => {
-  const evt = req.body;
-  if (evt.event === "PAYMENT_CONFIRMED") {
-    const customerId = evt.payment.customer;
-    // TODO: mapear customerId → sellerId e ativar plano no Webkul via API
-    console.log(`Pagamento confirmado para customer ${customerId}`);
-  }
+// Webhook Asaas (apenas loga para testes)
+app.post("/webhook/asaas", (req, res) => {
+  console.log("Webhook Asaas recebido:", req.body);
   res.sendStatus(200);
 });
 
-// Health‑check
-app.get("/", (req, res) => res.json({ status: "online" }));
-
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Asaas bridge rodando em ${PORT}`));
+// ————————————————————————————————
+// 4. Start
+// ————————————————————————————————
+app.listen(PORT, () => console.log(`Servidor ON na porta ${PORT}`));
