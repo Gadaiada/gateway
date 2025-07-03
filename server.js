@@ -79,6 +79,7 @@ async function ensureCustomer({ email, name }) {
 app.get("/", (_, res) => res.json({ status: "online" }));
 
 // Rota principal para gerar link de pagamento
+console.log("Token Asaas usado:", process.env.ASAAS_TOKEN);
 app.get("/checkout/asaas", async (req, res) => {
   const { email, name } = req.query;
 
