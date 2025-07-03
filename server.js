@@ -1,84 +1,96 @@
 // server.js
 import express from "express";
-import dotenv   from "dotenv";
-import fetch    from "node-fetch";   // node-fetch v3
-import dayjs    from "dayjs";
-import cors     from "cors";
+import dotenv from "dotenv";
+import fetch from "node-fetch";
+import dayjs from "dayjs";
+import cors from "cors";
 
 dotenv.config();
 
-const app  = express();
-const PORT = process.env.PORT || 4000;
+// Validação mínima das variáveis de ambiente
+const { ASAAS_TOKEN, PLAN_VALUE, PLAN_DESCRIPTION, PORT = 4000 } = process.env;
+if (!ASAAS_TOKEN || !PLAN_VALUE || !PLAN_DESCRIPTION) {
+  console.error(
+    "[ERRO] Variáveis de ambiente ASAAS_TOKEN, PLAN_VALUE e PLAN_DESCRIPTION são obrigatórias!"
+  );
+  process.exit(1);
+}
 
-// ————————————————————————————————
-// 1. Middleware
-// ————————————————————————————————
+const app = express();
 
-// CORS simples para chamadas frontend
+// Middleware CORS para permitir chamadas do front
 app.use(cors());
 
-// Para receber JSON no webhook
+// Middleware para interpretar JSON no webhook
 app.use(express.json());
 
-// ————————————————————————————————
-// 2. Helpers
-// ————————————————————————————————
 const ASAAS_BASE = "https://api.asaas.com/v3";
 
-// Wrapper que sempre devolve JSON ou lança erro com log detalhado
-const asaas = async (path, { method = "GET", body = null } = {}) => {
-  const res = await fetch(`${ASAAS_BASE}${path}`, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      access_token: process.env.ASAAS_TOKEN,
-    },
-    body: body ? JSON.stringify(body) : null,
-  });
-
-  const raw = await res.text();         // corpo bruto (pode ser vazio)
-
-  if (!res.ok) {
-    console.error(`Asaas ${method} ${path} → ${res.status}`, raw);
-    throw new Error(`Asaas ${res.status} ${path}`);
-  }
-
-  if (!raw) return {};                  // evita “Unexpected end of JSON input”
-
+// Helper para chamadas à API Asaas
+async function asaas(path, options = {}) {
   try {
-    return JSON.parse(raw);
-  } catch (e) {
-    console.error(`Falha ao parsear JSON (${path}):`, raw.slice(0, 200));
-    throw new Error("Resposta Asaas não‑JSON");
+    const res = await fetch(`${ASAAS_BASE}${path}`, {
+      method: options.method || "GET",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${ASAAS_TOKEN}`, // Melhor usar Bearer token
+        ...(options.headers || {}),
+      },
+      body: options.body ? JSON.stringify(options.body) : null,
+    });
+
+    const raw = await res.text();
+
+    if (!res.ok) {
+      console.error(`[Asaas ${res.status} ${path}] Resposta:`, raw);
+      throw new Error(`Erro Asaas ${res.status}: ${raw}`);
+    }
+
+    if (!raw) return {};
+
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      console.error(`[Falha parse JSON] ${path}:`, raw.slice(0, 200));
+      throw new Error("Resposta Asaas inválida (não é JSON)");
+    }
+  } catch (err) {
+    console.error(`[Fetch Asaas] Falha na requisição ${path}:`, err.message);
+    throw err;
   }
-};
+}
 
-// Busca cliente pelo e‑mail; cria se não existir
-const ensureCustomer = async ({ email, name }) => {
+// Busca cliente pelo email, cria se não existir
+async function ensureCustomer({ email, name }) {
   const search = await asaas(`/customers?email=${encodeURIComponent(email)}`);
-  if (search?.data?.length) return search.data[0];
+  if (search?.data?.length) {
+    console.log(`[Cliente] Encontrado customer ID ${search.data[0].id} para email ${email}`);
+    return search.data[0];
+  }
 
+  console.log(`[Cliente] Criando novo customer para email ${email}`);
   return asaas("/customers", {
     method: "POST",
     body: { email, name },
   });
-};
+}
 
-// ————————————————————————————————
-// 3. Rotas
-// ————————————————————————————————
+// Rota raiz
 app.get("/", (_, res) => res.json({ status: "online" }));
 
+// Rota principal para gerar link de pagamento
 app.get("/checkout/asaas", async (req, res) => {
   const { email, name } = req.query;
-  if (!email || !name)
-    return res.status(400).json({ error: "Parâmetros email e name são obrigatórios" });
+
+  if (!email || !name) {
+    return res
+      .status(400)
+      .json({ error: "Parâmetros email e name são obrigatórios" });
+  }
 
   try {
-    // 1. cliente
     const customer = await ensureCustomer({ email, name });
 
-    // 2. assinatura
     const subscription = await asaas("/subscriptions", {
       method: "POST",
       body: {
@@ -86,35 +98,36 @@ app.get("/checkout/asaas", async (req, res) => {
         billingType: "UNDEFINED",
         cycle: "MONTHLY",
         nextDueDate: dayjs().add(1, "day").format("YYYY-MM-DD"),
-        value: Number(process.env.PLAN_VALUE),
-        description: process.env.PLAN_DESCRIPTION,
+        value: Number(PLAN_VALUE),
+        description: PLAN_DESCRIPTION,
       },
     });
 
-    // 3. link de pagamento
     const link = await asaas("/paymentLinks", {
       method: "POST",
       body: {
         chargeType: "SUBSCRIPTION",
         subscription: subscription.id,
-        name: process.env.PLAN_DESCRIPTION,
+        name: PLAN_DESCRIPTION,
       },
     });
 
+    console.log(`[Pagamento] Gerado link para ${email}: ${link.url}`);
+
     return res.json({ invoiceUrl: link.url });
-  } catch (e) {
-    console.error("checkout/asaas erro:", e.message);
-    return res.status(500).json({ error: "erro interno", message: e.message });
+  } catch (err) {
+    console.error("[Erro checkout/asaas]:", err.message);
+    return res.status(500).json({ error: "erro interno", message: err.message });
   }
 });
 
-// Webhook Asaas (apenas loga para testes)
+// Webhook para receber notificações do Asaas
 app.post("/webhook/asaas", (req, res) => {
-  console.log("Webhook Asaas recebido:", req.body);
+  console.log("[Webhook Asaas] Evento recebido:", req.body);
   res.sendStatus(200);
 });
 
-// ————————————————————————————————
-// 4. Start
-// ————————————————————————————————
-app.listen(PORT, () => console.log(`Servidor ON na porta ${PORT}`));
+// Inicia o servidor
+app.listen(PORT, () => {
+  console.log(`Servidor ON na porta ${PORT}`);
+});
