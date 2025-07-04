@@ -24,7 +24,7 @@ app.use(cors());
 // Middleware para interpretar JSON no webhook
 app.use(express.json());
 
-const ASAAS_BASE = "https://api.asaas.com/v3";
+const ASAAS_BASE = "https://sandbox.asaas.com/api/v3";
 
 // Helper para chamadas à API Asaas
 async function asaas(path, options = {}) {
